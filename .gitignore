@@ -1,0 +1,23 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+*.egg-info/
+.code-review-graph/
+backend/raw-imports/
+backend/test-results/
+*.pyc
+venv/
+node_modules/
+dist/
+.vscode/
+.DS_Store
+
+# Local demo verification artifacts
+/output/
+frontend/test-results/
+frontend/playwright-report/

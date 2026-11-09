@@ -1,0 +1,163 @@
+# NOVA sales backend
+
+Local Python 3.12 / FastAPI / PostgreSQL 17 backend for synthetic DoorDash and Grubhub reports. Docker Compose is the only required host runtime. No provider credentials are needed.
+
+This backend serves observed sales records, plus order search, top dishes, and John's OpenRouter rush-hour analysis. The integration branch also adds sales-only K-Station forecasts at `/tablet` and `/tablet/outlook`, connected to the tablet app. It does not calculate ingredients or inventory.
+
+For a second large sales-only scenario, see [Harbor Deli synthetic reports and verified API exports](../data/sales_only_demo/README.md). It contains 45,000 orders with changing channel mix, dish trends, and location-specific demand patterns, using only the supported sales fields.
+
+For the October food-truck scenario, see [K-Station / Tartan Express](../data/kstation_demo/README.md). Its combined DoorDash/Grubhub orders demonstrate repeated meal rushes, a Thursday afternoon rush, and a single isolated spike. Menu inspiration is attributed to CMU; all orders and demand assumptions are synthetic.
+
+## Start the backend
+
+Run these commands from `backend/`:
+
+```sh
+cp .env.example .env
+docker compose build
+docker compose up -d db
+docker compose run --rm migrate
+docker compose up -d api
+```
+
+The API is available at [http://127.0.0.1:8000](http://127.0.0.1:8000). Interactive documentation is at [/docs](http://127.0.0.1:8000/docs); the machine-readable contract is at [/openapi.json](http://127.0.0.1:8000/openapi.json). The root URL has no application route.
+
+Database migrations are explicit. Run `docker compose run --rm migrate` after pulling schema changes; starting the API does not create tables. Alembic records applied versions, so repeating the command does not recreate existing tables. Create future migrations using `docker compose run --rm -v "$PWD:/app" migrate alembic revision --autogenerate -m 'describe change'`, then review the generated migration before applying it. The writable backend mount saves the new migration into your checkout.
+
+Set `API_PORT`, `DB_PORT`, or `CORS_ORIGINS` in `.env` before starting if the default ports/origins are unsuitable. Host ports bind only to loopback. The local database is `nova_sales`, user `nova`, password `nova_local`, exposed at `127.0.0.1:55433`. These are development values, not production credentials. The API connects over the Compose network rather than the host port. CORS origins are a JSON array of explicit HTTP localhost origins.
+
+After changing code, rebuild with `docker compose build` and recreate the API with `docker compose up -d api`. Dependencies are pinned in `requirements.lock`; the Docker build installs the lock before the application.
+
+## Import the small fixtures
+
+Both files contain six complete orders, three per platform store. They are derived from the committed synthetic reports without regenerating the dataset.
+
+```sh
+docker compose run --rm api python -m nova_backend.imports --source doordash --file /app/fixtures/doordash_order_detail.csv --synthetic --complete-orders
+docker compose run --rm api python -m nova_backend.imports --source grubhub --file /app/fixtures/grubhub_menu_line_items.csv --synthetic --complete-orders
+```
+
+Expected combined records: four platform stores, twelve orders, and twenty-one item lines. Repeat either command to refresh the included orders without duplicating sales. Each attempt creates its own import audit record.
+
+`--synthetic` and `--complete-orders` are required assertions. Only use files known to contain complete line sets for their included orders. The importer cannot prove completeness from a CSV. It refreshes those orders and leaves absent orders unchanged. Order IDs stay stable; internal item-line IDs can change after a refresh.
+
+For other local files, place them inside this repository and reference them through the read-only `/workspace/` mount. Original files are archived under a unique import ID in the `raw-imports` volume. Parsed line `source_details` preserve original CSV cells, row numbers, and time warnings. Files and extra fields can contain merchant information; keep this local until access controls are added.
+
+Optional CLI metadata: `--report-version` for DoorDash (default 2, minimum 2) and `--provider-report-id`. Grubhub has no configured report version. IDs remain strings, including leading zeros. Prices and quantities use exact decimal storage. Real exports still need validation of units, modifier encoding, timestamp meanings, and complete-order semantics.
+
+`import_runs.requested_columns` records the local file's columns. `date_start` and exclusive `date_end` describe observed placement dates, not requested provider coverage or proof that every intervening date is complete. `completed_at` is import completion time, not a provider data cutoff.
+
+## Query the data
+
+```sh
+curl 'http://127.0.0.1:8000/stores'
+curl 'http://127.0.0.1:8000/orders?source=doordash&limit=2'
+curl 'http://127.0.0.1:8000/order-lines?date_start=2026-05-01&date_end=2026-05-02'
+curl 'http://127.0.0.1:8000/items?source=grubhub'
+curl 'http://127.0.0.1:8000/imports?status=succeeded'
+```
+
+| Endpoint | Filters | Meaning |
+| --- | --- | --- |
+| `/stores` | `source` | Platform store identities |
+| `/orders` | `source`, `store_id`, `date_start`, `date_end` | One row per order |
+| `/order-lines` | Same as orders | Joined source/store/order/item records for analytics |
+| `/items` | `source`, `store_id` | Observed store-scoped items and latest labels, not a complete menu |
+| `/imports` | `source`, `status` | Import status and provenance without raw filesystem paths |
+
+All five endpoints accept `limit` (default 100, maximum 500) and `cursor`. Responses contain `data` and `next_cursor`. Pass the cursor unchanged with the same endpoint and filters to get the next page. Cursors are pagination positions, not authorization tokens. Pagination assumes the dataset is unchanged between requests.
+
+`store_id` is the internal UUID from `/stores`, not a provider's external store ID. Dates filter store-local placement dates with an inclusive start and exclusive end. Unknown valid store UUIDs return empty lists. Invalid filters/cursors return HTTP 400; unexpected server failures return a generic HTTP 500.
+
+Prices are decimal strings or null. Whole-number quantities are JSON integers; fractional quantities are decimal strings to preserve precision. Local timestamps have no UTC offset and are paired with their source timezone. Ambiguous local times are preserved with a warning; nonexistent local times fail validation. No absolute timestamp is guessed.
+
+Every order/line carries its source and import provenance, including synthetic status. Count distinct internal order IDs for order volume; sum line quantities for dish volume. Never sum repeated raw subtotals across lines. Grubhub subtotals and unconfirmed DoorDash modifiers stay null.
+
+## Search orders and rank dishes
+
+```sh
+curl 'http://127.0.0.1:8000/orders/filter?store_name=strip&date=2026-05-01&time_start=11:00&time_end=13:00&item_name=burger'
+curl 'http://127.0.0.1:8000/dishes/top?limit=5&date_start=2026-05-01&date_end=2026-06-01'
+```
+
+| Endpoint | Filters | Meaning |
+| --- | --- | --- |
+| `/orders/filter` | `store_id`, `store_name`, `source`, `date` or `date_start`/`date_end`, `time_start`/`time_end`, `item_name` | Matching orders, oldest first, each with all of its items. Paged with `limit`/`cursor` |
+| `/dishes/top` | `limit` (number of dishes, default 10, max 100), `start`/`end`, plus every filter above except `item_name` | Dishes ranked by units sold, then order count, then name |
+
+Both endpoints read through `queries.list_stores` and `queries.list_order_lines`, the functions behind `/stores` and `/order-lines`, in `nova_backend/analytics.py`. They page through every matching line, so prefer a date range on the full dataset.
+
+- `store_name` and `item_name` are case-insensitive substring matches; `store_name=Craig St` covers that store on both platforms.
+- `date` is one store-local day. It cannot be combined with `date_start`/`date_end`.
+- `time_start`/`time_end` are store-local times of day, start inclusive and end exclusive. A start after the end crosses midnight, so `time_start=22:00&time_end=02:00` means late night.
+- `/dishes/top` also takes exact store-local moments: `start=2026-05-01T11:00&end=2026-05-01T13:30` (start inclusive, end exclusive, either optional, and they can span days). They cannot be combined with `date`/`date_start`/`date_end`, unlike `time_start`/`time_end`, which apply a time of day to every day in the range.
+- `/dishes/top` groups dishes by exact item name across platforms and stores. It reports `units` (summed quantities) and `orders` (distinct orders), and echoes the date range it used.
+
+## Predict rush hours
+
+```sh
+curl 'http://127.0.0.1:8000/rush-hours?date=2026-10-23&time=10:00&store_name=Strip%20District'
+curl 'http://127.0.0.1:8000/rush-hours?date=2026-11-13&time=16:30&context=home%20football%20game%20at%208pm'
+```
+
+`GET /rush-hours` predicts the time frames of heavy order traffic on `date`, from `time` (the current store-local time, default 00:00) onward. Each window says whether it is `in_progress` or `upcoming` and how many minutes away it is.
+
+| Parameter | Meaning |
+| --- | --- |
+| `date` (required), `time`, `until` | The day, the current time, and an optional cutoff |
+| `store_name`, `store_id`, `source` | Store scope, as in `/orders/filter` |
+| `context` | What the manager knows about the day (event, weather); only the AI agent uses it |
+| `weeks` (default 8), `slot_minutes` (15, 30, or 60) | History to average and slot size |
+| `use_agent` (default true) | Set false to skip OpenRouter |
+
+How it decides, in `nova_backend/rush.py` and `nova_backend/rush_agent.py`:
+
+1. Python averages distinct orders per slot over the same weekday in the previous `weeks` weeks (days with no orders are skipped). A slot is a spike when it expects at least 1.5x the typical active slot and at least 2 orders; adjacent spike slots form one rush window.
+2. If `OPENROUTER_KEY` is set, an OpenRouter agent investigates with read-only tools built on the `/order-lines` and `/stores` query functions: `get_rush_forecast`, `get_day_traffic`, `count_orders`, and `get_top_dishes`. It only sees days before `date`. It returns rush windows, each with a multiplier between 0.5x and 2.0x and a reason.
+3. Python snaps the agent's windows to the slot grid, clamps multipliers (recording `clamped_from`), drops overlaps, and recomputes `expected_orders` and `expected_peak_orders` from the forecast. `agent_trace` lists each tool call with a one-line result.
+
+Without a key, with `use_agent=false`, or if OpenRouter fails, the response uses the plain forecast (`method: "baseline"`) and adds an `ai_unavailable` flag. `confidence` is low with fewer than 3 history days; otherwise it reflects how many recent weeks were busy in that window (`consistency`). When `date` already has recorded orders, `actual_orders` shows what really happened, as a backtest.
+
+To enable the agent, put the key in `backend/.env` (copy `.env.example`): `OPENROUTER_KEY=sk-or-...`. Compose passes it to the API container; recreate it with `docker compose up -d api`. `OPENROUTER_MODEL` picks any tool-calling model. Never commit `.env`: OpenRouter disables keys it finds in repositories.
+
+There is no automatic cross-platform restaurant or dish mapping. The feeds share a schema while retaining separate source identities. Analytics may reuse query functions under `nova_backend.queries` inside trusted Python code, or consume these endpoints.
+
+## Verify the implementation
+
+```sh
+docker compose --profile test run --rm test
+docker compose run --rm api ruff check .
+docker compose run --rm api ruff format --check .
+docker compose run --rm api python scripts/http_smoke.py http://api:8000
+```
+
+The HTTP smoke check requires a running API and both seeded fixtures. Run database verification commands serially: pytest and the full-dataset check share and clear the disposable test database. The test suite applies migrations to `db-test/nova_sales_test`, truncates its sales data between tests, and exercises migration downgrade/re-upgrade only there. The test database uses temporary storage and a different password/network address from development. Test guards refuse other database hosts/names.
+
+To reconcile the full platform files independently of the parser:
+
+```sh
+docker compose --profile test run --rm test alembic upgrade head
+docker compose --profile test run --rm test python scripts/full_dataset_smoke.py
+```
+
+This clears only the disposable test database and imports both reports twice. Expected totals are recomputed with the standard CSV reader, then compared with PostgreSQL. The committed dataset currently has 45,056 orders, 85,833 item lines, and 100,096 units. Reference, recipe, and operations files are not imported. A later pytest run clears test records again.
+
+## Operate locally
+
+`docker compose logs api` shows application logs. A database error commonly means migrations have not run; check `docker compose run --rm migrate alembic current`. If an import fails, inspect `/imports?status=failed` or its CLI message. Failed imports do not partially update sales. Detailed raw files stay in local storage; public errors omit raw rows, SQL, and private paths.
+
+`docker compose restart api db` preserves development data. `docker compose down` stops this project's containers while retaining named volumes. Do not use `down -v` unless you explicitly intend to erase this backend's development database and archived files. Leave other Docker projects untouched.
+
+This is a local synthetic-data implementation. There is no authentication or scheduled sync. Do not expose it publicly or load real merchant data before authorization and actual-export validation are designed.
+
+## Separate recommendation agent service
+
+The merged agent implementation runs separately through `main:app`; see [agent setup and endpoints](AGENT_README.md). The sales service runs through `nova_backend.api:app`. Both guides default to port 8000; choose different ports when running both. These services and the frontend have not yet been integrated.
+
+## K-Station tablet analysis
+
+`GET /tablet?date=2026-10-29` returns expected order traffic, rush windows, projected dish sales, and separately labeled observed sales. Optional `source=doordash` or `source=grubhub` selects one feed; omitting it combines only the two explicitly mapped K-Station stores.
+
+`GET /tablet/outlook?date=2026-10-29` returns a seven-day outlook with input history frozen before the start date. `/tablet` defaults to baseline mode and can opt into John's model-assisted analysis with `use_agent=true` and optional `context`; `/tablet/outlook` stays deterministic. Both use the existing sales query layer and read the current PostgreSQL records. The manifest maps provider item IDs to synthetic dishes. Invalid query parameters return 400; missing K-Station data returns 503.
+
+The demo API runs separately on port 8003 using `compose.demo.yaml`. Follow [the local demo guide](../docs/local-demo.md).
